@@ -25,6 +25,14 @@
 #define TIEMPO_ESPERA_ALERTA    10000  // ms antes de alerta automática
 #define INTERVALO_PULSO_MS        500  // ms entre pulsos de vibración
 
+// SpO2 — coeficientes de calibración de la fórmula SpO2 = A - B*R
+// Si el SpO2 marca siempre muy bajo (ej. 70-72%), AUMENTÁ SPO2_COEF_A
+// hasta que en una persona sana sin patologías marque ~95-99%.
+// Si marca siempre 100%, DISMINUÍ SPO2_COEF_A.
+#define SPO2_COEF_A              115.0f
+#define SPO2_COEF_B                8.0f
+#define SPO2_MINIMO               95    // Por debajo de esto se considera bajo
+
 // ------------------------------------------------------------
 //  BLE
 // ------------------------------------------------------------

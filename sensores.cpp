@@ -5,6 +5,7 @@
 #include "sensores.h"
 #include "config.h"
 #include <Arduino.h>
+#include <limits.h>
 #include <Wire.h>
 #include "MAX30105.h"
 #include "heartRate.h"
@@ -56,6 +57,15 @@ static float    _bpmInstant   = 0;
 static byte _tasas[RATE_SIZE] = {0};
 static byte _idx = 0;
 
+// ── SpO2 — completamente independiente del cálculo de BPM ──
+// Buffer circular de muestras IR/Rojo para estimar AC/DC de cada canal
+#define SPO2_BUFFER 100
+static long _bufIR[SPO2_BUFFER];
+static long _bufRojo[SPO2_BUFFER];
+static int  _bufN     = 0;   // cantidad de muestras válidas acumuladas
+static byte _bufIdx   = 0;
+static int  _spo2     = 0;   // 0 = aún no disponible
+
 static void _initMAX() {
   if (!_sensor.begin(Wire, I2C_SPEED_FAST)) {
     Serial.println("[MAX30102] No responde — verifica SDA=D7 SCL=D8");
@@ -68,10 +78,53 @@ static void _initMAX() {
   Serial.println("[MAX30102] OK — apoya el dedo con presión constante");
 }
 
+// Calcula SpO2 a partir del buffer circular (ratio R = ACred/DCred / ACir/DCir)
+static void _actualizarSpo2(long ir, long rojo) {
+  _bufIR[_bufIdx]   = ir;
+  _bufRojo[_bufIdx] = rojo;
+  _bufIdx = (_bufIdx + 1) % SPO2_BUFFER;
+  if (_bufN < SPO2_BUFFER) _bufN++;
+
+  // Espera a tener suficientes muestras para un cálculo estable
+  if (_bufN < SPO2_BUFFER) return;
+
+  long sumaIR = 0, sumaRojo = 0;
+  long maxIR = 0, minIR = LONG_MAX, maxRojo = 0, minRojo = LONG_MAX;
+  for (int i = 0; i < SPO2_BUFFER; i++) {
+    sumaIR   += _bufIR[i];
+    sumaRojo += _bufRojo[i];
+    if (_bufIR[i]   > maxIR)   maxIR   = _bufIR[i];
+    if (_bufIR[i]   < minIR)   minIR   = _bufIR[i];
+    if (_bufRojo[i] > maxRojo) maxRojo = _bufRojo[i];
+    if (_bufRojo[i] < minRojo) minRojo = _bufRojo[i];
+  }
+
+  float dcIR   = sumaIR   / (float)SPO2_BUFFER;
+  float dcRojo = sumaRojo / (float)SPO2_BUFFER;
+  float acIR   = (float)(maxIR   - minIR);
+  float acRojo = (float)(maxRojo - minRojo);
+
+  if (dcIR <= 0 || dcRojo <= 0 || acIR <= 0) return;
+
+  float R = (acRojo / dcRojo) / (acIR / dcIR);
+
+  // Fórmula calibrable: SpO2 = SPO2_COEF_A - SPO2_COEF_B * R
+  int calc = (int)(SPO2_COEF_A - SPO2_COEF_B * R);
+
+  // Log de R crudo para calibración manual (ver config.h)
+  Serial.print("[SpO2 calib] R="); Serial.print(R, 3);
+  Serial.print(" -> calc="); Serial.println(calc);
+
+  if (calc >= 70 && calc <= 100) {
+    _spo2 = calc;
+  }
+}
+
 static void _leerMAX() {
   if (!_maxListo) return;
 
-  long ir = _sensor.getIR();
+  long ir   = _sensor.getIR();
+  long rojo = _sensor.getRed();
   _dedo = (ir >= 50000);
 
   if (!_dedo) {
@@ -80,8 +133,14 @@ static void _leerMAX() {
     _bpmInstant   = 0;
     _ultimoLatido = 0;
     _idx          = 0;
+    _bufN         = 0;
+    _bufIdx       = 0;
+    _spo2         = 0;
     return;
   }
+
+  // SpO2: se acumula en paralelo, no afecta el cálculo de BPM
+  _actualizarSpo2(ir, rojo);
 
   if (checkForBeat(ir)) {
     long delta    = millis() - _ultimoLatido;
@@ -98,7 +157,10 @@ static void _leerMAX() {
 
       Serial.print("[MAX30102] IR=");  Serial.print(ir);
       Serial.print(" BPM=");          Serial.print((int)_bpmInstant);
-      Serial.print(" Avg BPM=");      Serial.println(_bpmPromedio);
+      Serial.print(" Avg BPM=");      Serial.print(_bpmPromedio);
+      Serial.print(" SpO2=");
+      if (_spo2 > 0) Serial.print(_spo2); else Serial.print("--");
+      Serial.println("%");
     }
   }
 }
@@ -114,9 +176,9 @@ void audioInit() {
   _serialDF.begin(9600, SERIAL_8N1, PIN_DFPLAYER_RX, PIN_DFPLAYER_TX);
   delay(1000);
   if (_df.begin(_serialDF)) {
-    _df.volume(10);
+    _df.volume(25);
     _dfListo = true;
-    Serial.println("[DFPlayer] OK — volumen 10/30");
+    Serial.println("[DFPlayer] OK — volumen 25/30");
   } else {
     Serial.println("[DFPlayer] No responde — verifica MicroSD y parlante");
   }
@@ -150,3 +212,5 @@ bool caidaDetectada() { return _caidaDetectada;                      }
 int  bpmActual()      { return _bpmPromedio;                         }
 bool bpmElevado()     { return _bpmPromedio >= BPM_ELEVADO && _dedo; }
 bool dedoDetectado()  { return _dedo;                                }
+int  spo2Actual()     { return _spo2;                                }
+bool spo2Bajo()       { return _spo2 > 0 && _spo2 < 95;              }
