@@ -230,7 +230,7 @@ void audioInit() {
   _serialDF.begin(9600, SERIAL_8N1, PIN_DFPLAYER_RX, PIN_DFPLAYER_TX);
   delay(1000);
   if (_df.begin(_serialDF)) {
-    _df.volume(25);
+    _df.volume(10);
     _dfListo = true;
     Serial.println("[DFPlayer] OK — volumen 25/30");
   } else {
@@ -267,7 +267,7 @@ int  bpmActual()      { return _bpmPromedio;                         }
 bool bpmElevado()     { return _bpmPromedio >= BPM_ELEVADO && _dedo; }
 bool dedoDetectado()  { return _dedo;                                }
 int  spo2Actual()     { return _spo2;                                }
-bool spo2Bajo()       { return _spo2 > 0 && _spo2 < 95;              }
+bool spo2Bajo()       { return _spo2 > 0 && _spo2 < 90;              }
 bool cuerpoInmovil()  { return _inmovil;                             }
 bool bpmCaidaBrusca() { return _bpmCaidaBrusca && _dedo;             }
 
