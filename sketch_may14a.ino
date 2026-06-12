@@ -126,6 +126,10 @@ static uint32_t      _tInicioAdvert  = 0;
 static uint32_t      _tUltimoSegundo = 0;
 static uint32_t      _tUltimoBpm     = 0;
 
+// Triple-click para cancelar falso positivo durante ADVERTENCIA
+static byte           _cancelCount    = 0;
+static uint32_t       _tUltimoCancel  = 0;
+
 void entrarNormal() {
   _estado = ESTADO_NORMAL;
   motorApagar();
@@ -139,6 +143,8 @@ void entrarAdvertencia() {
   _estado         = ESTADO_ADVERTENCIA;
   _tInicioAdvert  = millis();
   _tUltimoSegundo = millis();
+  _cancelCount    = 0;
+  _tUltimoCancel  = 0;
   motorIniciarPulsos();
   bleEnviar("ADVERTENCIA_CAIDA");
   Serial.println("[ESTADO] ADVERTENCIA — presiona CANCELAR en 10s");
@@ -196,16 +202,85 @@ void loop() {
   switch (_estado) {
 
     case ESTADO_NORMAL:
-      if (botonAlertaPresionado()) { entrarAlerta(); break; }
-      if (caidaDetectada() && bpmElevado()) {
-        Serial.print("[SENSOR] Caida + BPM: ");
+      if (botonAlertaPresionado()) {
+        Serial.println("[BTN] Alerta manual — vibrando 10s, triple-click para cancelar");
+        entrarAdvertencia();
+        break;
+      }
+
+      // ── Ruta A: caída física + signos vitales anormales ──
+      // El MPU6050 detectó un impacto/caída libre, y el corazón
+      // está acelerado (taquicardia post-impacto) o el cuerpo
+      // quedó inmóvil después — combinación típica de un desmayo
+      // con golpe.
+      if (caidaDetectada() && (bpmElevado() || cuerpoInmovil())) {
+        Serial.print("[SENSOR] Caida fisica detectada | BPM: ");
         Serial.println(bpmActual());
+        entrarAdvertencia();
+        break;
+      }
+
+      // ── Ruta B: pre-síncope sin caída todavía ──
+      // SpO2 bajo + caída brusca de BPM (bradicardia súbita) son
+      // las señales clásicas que preceden a un desmayo vasovagal,
+      // incluso antes de que la persona llegue a caerse.
+      if (sospechaDesmayo()) {
+        Serial.print("[SENSOR] Pre-sincope: SpO2=");
+        Serial.print(spo2Actual());
+        Serial.print("% BPM=");
+        Serial.println(bpmActual());
+        entrarAdvertencia();
+        break;
+      }
+
+      // ── Ruta C: inmovilidad prolongada + SpO2 bajo ──
+      // La persona no se movió en varios segundos y su oxigenación
+      // está baja — podría estar inconsciente sin haber caído
+      // (ej. se desmayó sentada).
+      if (cuerpoInmovil() && spo2Bajo()) {
+        Serial.println("[SENSOR] Inmovilidad + SpO2 bajo");
         entrarAdvertencia();
       }
       break;
 
     case ESTADO_ADVERTENCIA: {
-      if (botonCancelarPresionado()) { entrarNormal(); break; }
+
+      // Triple-click para confirmar falso positivo:
+      // hay que presionar CANCELAR 3 veces, cada una dentro de
+      // CANCEL_VENTANA_MS desde la anterior. Si pasa demasiado
+      // tiempo entre presiones, el contador se reinicia.
+      if (botonCancelarPresionado()) {
+        uint32_t ahora = millis();
+
+        if (_cancelCount == 0 || (ahora - _tUltimoCancel) <= CANCEL_VENTANA_MS) {
+          _cancelCount++;
+          _tUltimoCancel = ahora;
+
+          Serial.print("[ADVERTENCIA] Cancelar presionado (");
+          Serial.print(_cancelCount);
+          Serial.print("/");
+          Serial.print(CANCEL_PULSACIONES_REQUERIDAS);
+          Serial.println(")");
+
+          if (_cancelCount >= CANCEL_PULSACIONES_REQUERIDAS) {
+            Serial.println("[ADVERTENCIA] Falso positivo confirmado");
+            entrarNormal();
+            break;
+          }
+        } else {
+          // Pasó demasiado tiempo desde la última presión: reinicia
+          _cancelCount   = 1;
+          _tUltimoCancel = ahora;
+          Serial.println("[ADVERTENCIA] Cancelar (1/3) — reiniciado por timeout");
+        }
+      }
+
+      // Si el usuario empezó a presionar pero no completó la
+      // secuencia a tiempo, reinicia el contador (sin bloquear el resto)
+      if (_cancelCount > 0 && (millis() - _tUltimoCancel) > CANCEL_VENTANA_MS) {
+        _cancelCount = 0;
+      }
+
       uint32_t t = millis() - _tInicioAdvert;
       if (t >= TIEMPO_ESPERA_ALERTA) { entrarAlerta(); break; }
       if (millis() - _tUltimoSegundo >= 1000) {

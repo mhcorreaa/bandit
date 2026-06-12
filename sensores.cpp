@@ -21,6 +21,14 @@
 
 static bool _caidaDetectada = false;
 
+// Detección de inmovilidad: aceleración estable cerca de 1g por varios segundos
+// (típico de una persona desmayada/inconsciente en el piso)
+static float    _gActual          = 1.0f;
+static uint32_t _tUltimoMovimiento = 0;
+#define INMOVIL_TOLERANCIA   0.08f  // variación de G considerada "sin movimiento"
+#define INMOVIL_TIEMPO_MS    3000   // ms de quietud para considerar inmovilidad
+static bool _inmovil = false;
+
 static void _initMPU() {
   Wire.beginTransmission(MPU_ADDR);
   Wire.write(MPU_PWR);
@@ -41,6 +49,15 @@ static void _leerMPU() {
   float az = ((int16_t)(Wire.read() << 8 | Wire.read())) / ACCEL_LSB;
   float g  = sqrt(ax*ax + ay*ay + az*az);
   _caidaDetectada = (g > ACCEL_CAIDA_THRESHOLD) || (g < ACCEL_CAIDA_LIBRE);
+
+  // Inmovilidad: si la variación de G respecto a la lectura anterior
+  // es mínima, el cuerpo no se está moviendo (posible inconsciencia)
+  uint32_t ahora = millis();
+  if (fabs(g - _gActual) > INMOVIL_TOLERANCIA) {
+    _tUltimoMovimiento = ahora;  // hubo movimiento, reinicia el contador
+  }
+  _gActual = g;
+  _inmovil = (ahora - _tUltimoMovimiento) >= INMOVIL_TIEMPO_MS;
 }
 
 // ============================================================
@@ -56,6 +73,15 @@ static float    _bpmInstant   = 0;
 #define RATE_SIZE 4
 static byte _tasas[RATE_SIZE] = {0};
 static byte _idx = 0;
+
+// ── Variación brusca de BPM (posible pre-síncope) ──────────
+// Guarda el promedio de hace ~5s y lo compara con el actual.
+// Una caída brusca de BPM (bradicardia súbita) es señal clásica
+// de un síncope vasovagal inminente.
+#define BPM_HISTORIAL_MS  5000
+static int      _bpmHace5s        = 0;
+static uint32_t _tUltimoSnapshot  = 0;
+static bool     _bpmCaidaBrusca   = false;
 
 // ── SpO2 — completamente independiente del cálculo de BPM ──
 // Buffer circular de muestras IR/Rojo para estimar AC/DC de cada canal
@@ -115,6 +141,11 @@ static void _actualizarSpo2(long ir, long rojo) {
   Serial.print("[SpO2 calib] R="); Serial.print(R, 3);
   Serial.print(" -> calc="); Serial.println(calc);
 
+  // Si la presión del dedo aumenta, R puede bajar de lo normal y
+  // el cálculo da >100% — fisiológicamente el máximo real es 100%,
+  // así que se recorta (clamp) en vez de descartar la lectura.
+  if (calc > 100) calc = 100;
+
   if (calc >= 70 && calc <= 100) {
     _spo2 = calc;
   }
@@ -136,6 +167,9 @@ static void _leerMAX() {
     _bufN         = 0;
     _bufIdx       = 0;
     _spo2         = 0;
+    _bpmHace5s       = 0;
+    _bpmCaidaBrusca  = false;
+    _tUltimoSnapshot = 0;
     return;
   }
 
@@ -162,6 +196,26 @@ static void _leerMAX() {
       if (_spo2 > 0) Serial.print(_spo2); else Serial.print("--");
       Serial.println("%");
     }
+  }
+
+  // ── Tracking de variación brusca de BPM (independiente de checkForBeat) ──
+  uint32_t ahora = millis();
+  if (_tUltimoSnapshot == 0) _tUltimoSnapshot = ahora;
+  if (ahora - _tUltimoSnapshot >= BPM_HISTORIAL_MS) {
+    // Compara el BPM de hace 5s contra el actual
+    if (_bpmHace5s > 0 && _bpmPromedio > 0) {
+      int delta = _bpmHace5s - _bpmPromedio;
+      // Caída de más de 25 bpm en 5s = posible bradicardia súbita (pre-síncope)
+      _bpmCaidaBrusca = (delta >= 25);
+      if (_bpmCaidaBrusca) {
+        Serial.print("[ALERTA BPM] Caida brusca: ");
+        Serial.print(_bpmHace5s);
+        Serial.print(" -> ");
+        Serial.println(_bpmPromedio);
+      }
+    }
+    _bpmHace5s       = _bpmPromedio;
+    _tUltimoSnapshot = ahora;
   }
 }
 
@@ -214,3 +268,11 @@ bool bpmElevado()     { return _bpmPromedio >= BPM_ELEVADO && _dedo; }
 bool dedoDetectado()  { return _dedo;                                }
 int  spo2Actual()     { return _spo2;                                }
 bool spo2Bajo()       { return _spo2 > 0 && _spo2 < 95;              }
+bool cuerpoInmovil()  { return _inmovil;                             }
+bool bpmCaidaBrusca() { return _bpmCaidaBrusca && _dedo;             }
+
+// Señal combinada de pre-síncope: SpO2 bajo + caída brusca de BPM,
+// sin necesidad de que ya haya ocurrido la caída física
+bool sospechaDesmayo() {
+  return spo2Bajo() && bpmCaidaBrusca();
+}

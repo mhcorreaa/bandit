@@ -25,6 +25,12 @@
 #define TIEMPO_ESPERA_ALERTA    10000  // ms antes de alerta automática
 #define INTERVALO_PULSO_MS        500  // ms entre pulsos de vibración
 
+// Confirmación de falso positivo: durante ADVERTENCIA, hay que
+// presionar CANCELAR esta cantidad de veces seguidas, cada una
+// dentro de la ventana de tiempo indicada, para volver a NORMAL.
+#define CANCEL_PULSACIONES_REQUERIDAS  3
+#define CANCEL_VENTANA_MS              2000  // ms máx entre presiones
+
 // SpO2 — coeficientes de calibración de la fórmula SpO2 = A - B*R
 // Si el SpO2 marca siempre muy bajo (ej. 70-72%), AUMENTÁ SPO2_COEF_A
 // hasta que en una persona sana sin patologías marque ~95-99%.
