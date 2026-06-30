@@ -1,6 +1,8 @@
 // ============================================================
 //  sketch_may14a.ino — MAIN
 //  Pulsera Disautonomia | XIAO ESP32-C3
+//  v3: máquina de estados OR | sin SpO2 | + filtro postural
+//      + choque cardíaco | caída como contexto, no ruta independiente
 // ============================================================
 
 #include "config.h"
@@ -12,7 +14,7 @@
 //  PROTOTIPOS
 // ============================================================
 void entrarNormal();
-void entrarAdvertencia();
+void entrarAdvertencia(const char* motivo);
 void entrarAlerta(const char* tipo);
 void bleEnviarJson(const char* json);
 void bleInit();
@@ -84,12 +86,11 @@ class CBComando : public NimBLECharacteristicCallbacks {
     String cmd = String(pChar->getValue().c_str());
     cmd.trim();
     Serial.print("[BLE RX] "); Serial.println(cmd);
-    if      (cmd == "ACTIVAR")  entrarAlerta("MANUAL");
+    if      (cmd == "ACTIVAR")  entrarAdvertencia("MANUAL_BLE");
     else if (cmd == "CANCELAR") entrarNormal();
   }
 };
 
-// Envía un JSON por BLE notify
 void bleEnviarJson(const char* json) {
   if (!_bleConectado || !_pTxChar) return;
   _pTxChar->setValue(json);
@@ -125,13 +126,25 @@ void bleInit() {
 static EstadoSistema _estado         = ESTADO_NORMAL;
 static uint32_t      _tInicioAdvert  = 0;
 static uint32_t      _tUltimoSegundo = 0;
-static uint32_t      _tUltimoBpm     = 0;  // reporte serial cada 2s
+static uint32_t      _tUltimoBpm     = 0;
 static uint32_t      _tUltimoMPU     = 0;
-static uint32_t      _tUltimoBle     = 0;  // envío BLE cada 1s
+static uint32_t      _tUltimoBle     = 0;
 
 // Triple-click para cancelar falso positivo durante ADVERTENCIA
-static byte           _cancelCount    = 0;
-static uint32_t       _tUltimoCancel  = 0;
+static byte           _cancelCount   = 0;
+static uint32_t       _tUltimoCancel = 0;
+
+// Contexto de caída:
+// Cuando el MPU detecta una caída real, se registra el timestamp.
+// Durante CAIDA_CONTEXTO_MS las rutas ópticas se evalúan sin
+// requerir postura erguida. Si el tiempo expira sin anomalía
+// cardíaca, la caída se descarta silenciosamente.
+static uint32_t      _tUltimaCaida  = 0;   // 0 = sin caída reciente
+
+inline bool _calidaEnContexto() {
+  return _tUltimaCaida > 0 &&
+         (millis() - _tUltimaCaida) < CAIDA_CONTEXTO_MS;
+}
 
 void entrarNormal() {
   _estado = ESTADO_NORMAL;
@@ -140,7 +153,7 @@ void entrarNormal() {
   Serial.println("[ESTADO] NORMAL");
 }
 
-void entrarAdvertencia() {
+void entrarAdvertencia(const char* motivo) {
   if (_estado == ESTADO_ADVERTENCIA) return;
   _estado         = ESTADO_ADVERTENCIA;
   _tInicioAdvert  = millis();
@@ -148,19 +161,17 @@ void entrarAdvertencia() {
   _cancelCount    = 0;
   _tUltimoCancel  = 0;
   motorIniciarPulsos();
-  Serial.println("[ESTADO] ADVERTENCIA — presiona CANCELAR en 10s");
+  Serial.print("[ESTADO] ADVERTENCIA motivo=");
+  Serial.println(motivo);
+  Serial.println("          → presiona CANCELAR x3 en 10s para descartar");
 }
 
-// tipo = "MANUAL" o "AUTO" — solo para log serial, la app recibe siempre {"alert":1}
 void entrarAlerta(const char* tipo) {
   if (_estado == ESTADO_ALERTA) return;
   _estado = ESTADO_ALERTA;
   motorEncender();
   audioReproducirBucle();
-
-  // JSON de alerta → app: 1 = alerta activa
   bleEnviarJson("{\"alert\":1}");
-
   Serial.print("[ESTADO] ALERTA tipo="); Serial.println(tipo);
 }
 
@@ -171,7 +182,7 @@ void setup() {
   Serial.begin(115200);
   delay(500);
   Serial.println("\n================================");
-  Serial.println("   Pulsera Disautonomia BOOT");
+  Serial.println("   Pulsera Disautonomia BOOT v2");
   Serial.println("================================");
 
   motorInit();
@@ -193,7 +204,6 @@ void loop() {
   audioTick();
 
   // ── Envío BLE de BPM cada 1s ─────────────────────────
-  // Solo si hay dedo detectado y hay conexión BLE activa
   if (millis() - _tUltimoBle >= 1000) {
     _tUltimoBle = millis();
     if (dedoDetectado() && bpmActual() > 0) {
@@ -210,8 +220,8 @@ void loop() {
     Serial.print("[MPU] G=");
     Serial.print(g, 2);
     Serial.print("g");
-    if (cuerpoInmovil()) Serial.print(" (inmovil)");
-    else Serial.print(" (normal)");
+    Serial.print(cuerpoInmovil() ? "  INMOVIL" : "  movimiento");
+    Serial.print(posturaErguida() ? "  ERGUIDO" : "  ACOSTADO");
     Serial.println();
   }
 
@@ -221,30 +231,21 @@ void loop() {
 
     float g = gActual();
     const char* estadoG;
-    if      (g < ACCEL_CAIDA_LIBRE)       estadoG = "CAIDA LIBRE";
-    else if (g > ACCEL_CAIDA_THRESHOLD)   estadoG = "IMPACTO";
-    else if (g < 0.8f || g > 1.2f)        estadoG = "movimiento";
-    else                                   estadoG = "reposo";
+    if      (g < ACCEL_CAIDA_LIBRE)     estadoG = "CAIDA LIBRE";
+    else if (g > ACCEL_CAIDA_THRESHOLD) estadoG = "IMPACTO";
+    else if (g < 0.8f || g > 1.2f)     estadoG = "movimiento";
+    else                                estadoG = "reposo";
 
-    Serial.print("[MPU] G=");
-    Serial.print(g, 2);
-    Serial.print("g  estado=");
-    Serial.print(estadoG);
+    Serial.print("[MPU] G="); Serial.print(g, 2);
+    Serial.print("g  estado="); Serial.print(estadoG);
+    Serial.print("  postura="); Serial.print(posturaErguida() ? "ERGUIDO" : "ACOSTADO");
     if (cuerpoInmovil()) Serial.print("  INMOVIL");
     Serial.println();
 
     if (dedoDetectado()) {
-      Serial.print("[VIT] BPM=");
-      Serial.print(bpmActual());
-      if (bpmElevado()) Serial.print("(ALTO-SOSTENIDO)");
-      Serial.print("  SpO2=");
-      if (spo2Actual() > 0) {
-        Serial.print(spo2Actual());
-        Serial.print("%");
-        if (spo2Bajo()) Serial.print("(BAJO)");
-      } else {
-        Serial.print("--");
-      }
+      Serial.print("[VIT] BPM="); Serial.print(bpmActual());
+      if (bpmElevado())        Serial.print(" (ALTO-SOSTENIDO)");
+      if (choqueCardiaco())    Serial.print(" [CHOQUE-CARDIACO]");
       Serial.println();
     } else {
       Serial.println("[VIT] Sin contacto en sensor de pulso");
@@ -255,33 +256,57 @@ void loop() {
   // ── Máquina de estados ────────────────────────────────
   switch (_estado) {
 
-    case ESTADO_NORMAL:
+    case ESTADO_NORMAL: {
 
       // Alerta manual — botón rojo
+      // Pasa por ADVERTENCIA para dar 10s de gracia al paciente
+      // en caso de apriete accidental (bolsillo, deporte, etc.).
+      // Si no cancela en 10s → ALERTA automática igual que las rutas sensor.
       if (botonAlertaPresionado()) {
-        Serial.println("[BTN] Alerta manual");
-        entrarAlerta("MANUAL");
+        Serial.println("[BTN] Alerta manual — 10s para cancelar");
+        entrarAdvertencia("MANUAL");
         break;
       }
 
-      // Ruta A: caída confirmada + BPM elevado sostenido + SpO2 bajo + dedo detectado
-      if (dedoDetectado() && caidaDetectada() && bpmElevado() && spo2Bajo()) {
-        Serial.print("[SENSOR] Caida + BPM alto sostenido + SpO2 bajo | BPM=");
-        Serial.print(bpmActual());
-        Serial.print(" SpO2="); Serial.print(spo2Actual()); Serial.println("%");
-        entrarAdvertencia();
-        break;
+      // ── Registro de caída como contexto ──────────────────
+      // Una caída sola NO dispara advertencia (falso positivo deportivo).
+      // Solo abre una ventana de CAIDA_CONTEXTO_MS durante la cual
+      // las rutas ópticas se evalúan sin requerir postura erguida,
+      // porque el paciente puede haber quedado tendido en el suelo.
+      if (caidaDetectada()) {
+        _tUltimaCaida = millis();
+        Serial.println("[MPU] Caida registrada como contexto — esperando anomalia cardiaca");
       }
 
-      // Ruta B: estático + BPM elevado sostenido + SpO2 bajo + dedo detectado
-      if (dedoDetectado() && cuerpoInmovil() && bpmElevado() && spo2Bajo()) {
-        Serial.print("[SENSOR] Estatico + BPM alto sostenido + SpO2 bajo | BPM=");
-        Serial.print(bpmActual());
-        Serial.print(" SpO2="); Serial.print(spo2Actual()); Serial.println("%");
-        entrarAdvertencia();
-        break;
+      // Expiración silenciosa del contexto de caída
+      if (_tUltimaCaida > 0 && !_calidaEnContexto()) {
+        Serial.println("[MPU] Contexto de caida expirado sin anomalia — descartado");
+        _tUltimaCaida = 0;
+      }
+
+      // ── Evaluación de ruta óptica (choque cardíaco) ───────
+      // Se activa si:
+      //   a) paciente erguido (situación normal de síncope), O
+      //   b) hay una caída reciente en contexto (relajamos postura
+      //      porque puede estar en el suelo tras el colapso)
+      //
+      // En ambos casos se requiere dedo detectado.
+
+      if (dedoDetectado() && (posturaErguida() || _calidaEnContexto())) {
+
+        // Patrón de choque cardíaco:
+        // Taquicardia compensatoria → bradicardia brusca en ≤15s.
+        if (choqueCardiaco()) {
+          const char* motivo = _calidaEnContexto() ? "CAIDA+CHOQUE_CARDIACO" : "CHOQUE_CARDIACO";
+          Serial.print("[SENSOR] "); Serial.print(motivo);
+          Serial.print(" | BPM="); Serial.println(bpmActual());
+          _tUltimaCaida = 0;   // consumir contexto
+          entrarAdvertencia(motivo);
+          break;
+        }
       }
       break;
+    }
 
     case ESTADO_ADVERTENCIA: {
 
@@ -314,7 +339,7 @@ void loop() {
 
       uint32_t t = millis() - _tInicioAdvert;
       if (t >= TIEMPO_ESPERA_ALERTA) {
-        entrarAlerta("AUTO");   // pasaron 10s sin cancelar → alerta automática
+        entrarAlerta("AUTO");
         break;
       }
       if (millis() - _tUltimoSegundo >= 1000) {

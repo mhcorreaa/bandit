@@ -1,5 +1,8 @@
 // ============================================================
-//  sensores.cpp — MPU6050 (caída) + MAX30102 (BPM+SpO2) + DFPlayer
+//  sensores.cpp — MPU6050 (caída + postura) + MAX30102 (BPM)
+//                 + DFPlayer
+//  v3: sin SpO2 | + filtro postural | + choque cardíaco
+//                (colapso amplitud IR eliminado — ver nota más abajo)
 //  SDA=D4, SCL=D5 | MAX: 0x57 | MPU: 0x68
 // ============================================================
 #include "sensores.h"
@@ -24,10 +27,20 @@ static float    _gActual           = 1.0f;
 static uint32_t _tUltimoMovimiento = 0;
 static bool     _inmovil           = false;
 
-// Detección de caída en dos fases:
-// 1) Se entra en caída libre (g < ACCEL_CAIDA_LIBRE) y se registra el momento
-// 2) Si luego llega un impacto (g > ACCEL_CAIDA_THRESHOLD) habiendo pasado
-//    al menos CAIDA_LIBRE_MIN_MS en caída libre → caída real confirmada
+// Ejes crudos — necesarios para filtro postural
+static float _axFilt = 0.0f;   // promedio exponencial de ax
+static float _ayFilt = 0.0f;   // promedio exponencial de ay
+static float _azFilt = 0.0f;   // promedio exponencial de az
+#define POSTURA_ALPHA 0.05f     // constante del filtro paso-bajo (τ ≈ 1s a 20ms/ciclo)
+
+// Postura erguida:
+// La pulsera va en el bíceps con el brazo colgando → eje longitudinal
+// del brazo ≈ eje Y del sensor. Cuando el brazo está vertical (de pie/sentado)
+// |ay| > POSTURA_UMBRAL_VERTICAL y la proyección horizontal es pequeña.
+// Cuando el paciente está acostado, la gravedad se distribuye en ax/az.
+static bool _posturaErguida = false;
+
+// Detección de caída en dos fases
 static bool     _enCaidaLibre      = false;
 static uint32_t _tInicioCaidaLibre = 0;
 
@@ -52,41 +65,61 @@ static void _leerMPU() {
   float ax = ((int16_t)(Wire.read() << 8 | Wire.read())) / ACCEL_LSB;
   float ay = ((int16_t)(Wire.read() << 8 | Wire.read())) / ACCEL_LSB;
   float az = ((int16_t)(Wire.read() << 8 | Wire.read())) / ACCEL_LSB;
-  float g  = sqrt(ax*ax + ay*ay + az*az);
+  float g  = sqrtf(ax*ax + ay*ay + az*az);
   _gActual = g;
 
-  // ── Detección de caída en dos fases ──────────────────────
-  // Fase 1: entrada en caída libre
+  // ── Filtro paso-bajo para estimación postural ─────────
+  // Aísla el componente DC (gravedad) de cada eje.
+  // Alpha pequeño → respuesta lenta → inmune a movimientos bruscos.
+  _axFilt += POSTURA_ALPHA * (ax - _axFilt);
+  _ayFilt += POSTURA_ALPHA * (ay - _ayFilt);
+  _azFilt += POSTURA_ALPHA * (az - _azFilt);
+
+  // ── Clasificación postural ────────────────────────────
+  // Con la pulsera en el bíceps y el brazo colgando naturalmente,
+  // el eje que apunta hacia el suelo es Y. Se considera "erguido"
+  // cuando la componente vertical filtrada es dominante y supera
+  // el umbral. El umbral 0.65g equivale a ~40° de desviación máxima
+  // respecto a la vertical — cubre sentado con el brazo apoyado.
+  float ayAbs = fabsf(_ayFilt);
+  float horizPlane = sqrtf(_axFilt*_axFilt + _azFilt*_azFilt);
+
+  // Erguido: componente vertical dominante Y > 0.65g
+  //          Y el plano horizontal es <0.75g (no acostado de lado)
+  _posturaErguida = (ayAbs > POSTURA_UMBRAL_VERTICAL) &&
+                    (horizPlane < POSTURA_UMBRAL_HORIZONTAL);
+
+  // ── Detección de caída en dos fases ──────────────────
   if (g < ACCEL_CAIDA_LIBRE) {
     if (!_enCaidaLibre) {
       _enCaidaLibre      = true;
       _tInicioCaidaLibre = millis();
     }
   } else {
-    // Fase 2: impacto después de haber estado en caída libre suficiente tiempo
     if (_enCaidaLibre && g > ACCEL_CAIDA_THRESHOLD) {
       uint32_t duracionLibre = millis() - _tInicioCaidaLibre;
       if (duracionLibre >= CAIDA_LIBRE_MIN_MS) {
-        _caidaDetectada = true;  // latch — se consume en caidaDetectada()
+        _caidaDetectada = true;
         Serial.print("[MPU] Caida confirmada: libre=");
         Serial.print(duracionLibre);
         Serial.print("ms impacto=");
         Serial.print(g, 2);
         Serial.println("g");
       } else {
-        Serial.print("[MPU] Impacto descartado (caida libre muy breve: ");
+        Serial.print("[MPU] Impacto descartado (caida libre breve: ");
         Serial.print(duracionLibre);
-        Serial.println("ms) — probable movimiento brusco");
+        Serial.println("ms)");
       }
     }
-    // Salir de caída libre en cuanto g vuelve a rango normal
     if (g > ACCEL_CAIDA_LIBRE) _enCaidaLibre = false;
   }
 
-  // Inmovilidad
+  // ── Inmovilidad ───────────────────────────────────────
   uint32_t ahora = millis();
-  if (fabs(g - _gActual) > INMOVIL_TOLERANCIA) _tUltimoMovimiento = ahora;
-  _inmovil = (ahora - _tUltimoMovimiento) >= INMOVIL_TIEMPO_MS;
+  static float _gAnterior = 1.0f;
+  if (fabsf(g - _gAnterior) > INMOVIL_TOLERANCIA) _tUltimoMovimiento = ahora;
+  _gAnterior = g;
+  _inmovil   = (ahora - _tUltimoMovimiento) >= INMOVIL_TIEMPO_MS;
 }
 
 // ============================================================
@@ -103,25 +136,100 @@ static float    _bpmInstant  = 0;
 static byte _tasas[RATE_SIZE] = {0};
 static byte _idx = 0;
 
-// BPM elevado sostenido — para evitar lecturas random
-// Se lleva un contador de cuánto tiempo lleva el BPM sobre el umbral
-static uint32_t _tInicioBpmElevado = 0;
+// BPM elevado sostenido
+static uint32_t _tInicioBpmElevado   = 0;
 static bool     _bpmElevadoSostenido = false;
 
-// Variación brusca de BPM
-#define BPM_HISTORIAL_MS  5000
-static int      _bpmHace5s       = 0;
-static uint32_t _tUltimoSnapshot = 0;
-static bool     _bpmCaidaBrusca  = false;
+// NOTA: el detector de "colapso de amplitud IR" fue eliminado.
+// En pruebas reales con el sensor sin contacto directo en el bíceps
+// (~1mm de separación de la piel), la amplitud IR mostraba saltos
+// de escalón mecánicos (cambios de ángulo/presión del sensor que se
+// mantenían estables varios segundos y luego saltaban a otro nivel).
+// Estos saltos producían ratios de colapso de 0.03–0.04 — fisiológicamente
+// imposibles como caída real de perfusión en 2s — incluso con período
+// de estabilización y baseline mínimo. La amplitud absoluta IR no es
+// un proxy fiable de perfusión con este montaje de hardware.
+// El choque cardíaco (basado en timing de latidos, no en magnitud de
+// señal) es robusto a este problema y queda como única ruta óptica.
 
-// SpO2
-#define SPO2_BUFFER 100
-static long     _bufIR[SPO2_BUFFER];
-static long     _bufRojo[SPO2_BUFFER];
-static int      _bufN        = 0;
-static byte     _bufIdx      = 0;
-static int      _spo2        = 0;
-static uint32_t _tInicioBajo = 0;
+// ── Choque cardíaco ───────────────────────────────────────
+//
+// Máquina de estados simple de tres fases:
+//   REPOSO → TAQUI (cuando BPM > BPM_CHOQUE_TAQUI durante al menos
+//            BPM_CHOQUE_TAQUI_CONFIRMA_MS)
+//          → BRADI (cuando, dentro de BPM_CHOQUE_VENTANA_MS desde el
+//            inicio de la taquicardia, el BPM cae bajo BPM_CHOQUE_BRADI)
+//            → flag choqueCardiaco = true (latch, se limpia al soltar dedo
+//              o al salir de ESTADO_ALERTA desde el .ino)
+//
+// Se confirman ambas fases con un tiempo mínimo sostenido para evitar
+// disparos por latidos aislados.
+
+enum FaseChoque { CHOQUE_REPOSO, CHOQUE_TAQUI, CHOQUE_BRADI };
+static FaseChoque _faseChoque       = CHOQUE_REPOSO;
+static uint32_t   _tInicioTaqui     = 0;   // cuando entró en taquicardia
+static uint32_t   _tTaquiConfirmada = 0;   // cuando se confirmó la taquicardia
+static bool       _choqueCardiaco   = false;
+
+static void _actualizarChoqueCardiaco() {
+  if (!_dedo || _bpmPromedio == 0) {
+    _faseChoque   = CHOQUE_REPOSO;
+    _tInicioTaqui = 0;
+    return;
+  }
+
+  switch (_faseChoque) {
+    case CHOQUE_REPOSO:
+      if (_bpmPromedio > BPM_CHOQUE_TAQUI) {
+        _faseChoque   = CHOQUE_TAQUI;
+        _tInicioTaqui = millis();
+        Serial.print("[CHOQUE] Taquicardia iniciada: BPM=");
+        Serial.println(_bpmPromedio);
+      }
+      break;
+
+    case CHOQUE_TAQUI:
+      if (_bpmPromedio <= BPM_CHOQUE_TAQUI) {
+        // Se perdió la taquicardia antes de confirmar → vuelve a reposo
+        _faseChoque = CHOQUE_REPOSO;
+        break;
+      }
+      // Confirmar que la taquicardia se sostiene al menos BPM_CHOQUE_TAQUI_CONFIRMA_MS
+      if (_tTaquiConfirmada == 0 &&
+          (millis() - _tInicioTaqui) >= BPM_CHOQUE_TAQUI_CONFIRMA_MS) {
+        _tTaquiConfirmada = millis();
+        Serial.println("[CHOQUE] Taquicardia confirmada — esperando bradicardia");
+      }
+      // Ventana agotada sin bradicardia
+      if (_tTaquiConfirmada > 0 &&
+          (millis() - _tTaquiConfirmada) > BPM_CHOQUE_VENTANA_MS) {
+        Serial.println("[CHOQUE] Ventana expirada sin bradicardia — reset");
+        _faseChoque       = CHOQUE_REPOSO;
+        _tTaquiConfirmada = 0;
+      }
+      // Caída a bradicardia dentro de la ventana
+      if (_tTaquiConfirmada > 0 &&
+          _bpmPromedio < BPM_CHOQUE_BRADI &&
+          (millis() - _tTaquiConfirmada) <= BPM_CHOQUE_VENTANA_MS) {
+        _choqueCardiaco   = true;
+        _faseChoque       = CHOQUE_BRADI;
+        _tTaquiConfirmada = 0;
+        Serial.print("[CHOQUE] PATRON DETECTADO: taqui→bradi | BPM=");
+        Serial.println(_bpmPromedio);
+      }
+      break;
+
+    case CHOQUE_BRADI:
+      // La bandera es latch — se mantiene hasta que el .ino la consuma
+      // o el dedo se suelte (limpieza en _leerMAX al perder contacto)
+      break;
+  }
+}
+
+// ── DFPlayer ─────────────────────────────────────────────
+static HardwareSerial      _serialDF(1);
+static DFRobotDFPlayerMini _df;
+static bool                _dfListo = false;
 
 static void _initMAX() {
   if (!_sensor.begin(Wire, I2C_SPEED_FAST)) {
@@ -135,53 +243,16 @@ static void _initMAX() {
   Serial.println("[MAX30102] OK — apoya el dedo con presión constante");
 }
 
-static void _actualizarSpo2(long ir, long rojo) {
-  _bufIR[_bufIdx]   = ir;
-  _bufRojo[_bufIdx] = rojo;
-  _bufIdx = (_bufIdx + 1) % SPO2_BUFFER;
-  if (_bufN < SPO2_BUFFER) _bufN++;
-  if (_bufN < SPO2_BUFFER) return;
-
-  long sumaIR = 0, sumaRojo = 0;
-  long maxIR = 0, minIR = LONG_MAX, maxRojo = 0, minRojo = LONG_MAX;
-  for (int i = 0; i < SPO2_BUFFER; i++) {
-    sumaIR   += _bufIR[i];
-    sumaRojo += _bufRojo[i];
-    if (_bufIR[i]   > maxIR)   maxIR   = _bufIR[i];
-    if (_bufIR[i]   < minIR)   minIR   = _bufIR[i];
-    if (_bufRojo[i] > maxRojo) maxRojo = _bufRojo[i];
-    if (_bufRojo[i] < minRojo) minRojo = _bufRojo[i];
-  }
-
-  float dcIR   = sumaIR   / (float)SPO2_BUFFER;
-  float dcRojo = sumaRojo / (float)SPO2_BUFFER;
-  float acIR   = (float)(maxIR   - minIR);
-  float acRojo = (float)(maxRojo - minRojo);
-
-  if (dcIR <= 0 || dcRojo <= 0 || acIR <= 0) return;
-
-  float R    = (acRojo / dcRojo) / (acIR / dcIR);
-  int   calc = (int)(SPO2_COEF_A - SPO2_COEF_B * R);
-  if (calc > 100) calc = 100;
-
-  if (calc >= 70 && calc <= 100) {
-    _spo2 = calc;
-    if (_spo2 < SPO2_MINIMO) {
-      if (_tInicioBajo == 0) _tInicioBajo = millis();
-    } else {
-      _tInicioBajo = 0;
-    }
-  }
-}
-
 static void _leerMAX() {
   if (!_maxListo) return;
 
   _sensor.check();
 
   while (_sensor.available()) {
-    long ir   = _sensor.getFIFOIR();
-    long rojo = _sensor.getFIFORed();
+    long ir = _sensor.getFIFOIR();
+    // Nota: ya no leemos el canal rojo (getFIFORed) — solo se usaba
+    // para SpO2 (eliminado) y colapso de amplitud IR (eliminado).
+    // Solo IR es necesario para detección de latidos (checkForBeat).
     _sensor.nextSample();
 
     bool dedoAntes = _dedo;
@@ -189,30 +260,28 @@ static void _leerMAX() {
 
     if (!_dedo) {
       if (dedoAntes) {
+        // Reset completo al perder contacto
         for (byte i = 0; i < RATE_SIZE; i++) _tasas[i] = 0;
-        _bpmPromedio          = 0;
-        _bpmInstant           = 0;
-        _ultimoLatido         = 0;
-        _idx                  = 0;
-        _bufN                 = 0;
-        _bufIdx               = 0;
-        _spo2                 = 0;
-        _tInicioBajo          = 0;
-        _bpmHace5s            = 0;
-        _bpmCaidaBrusca       = false;
-        _tUltimoSnapshot      = 0;
-        _tInicioBpmElevado    = 0;
-        _bpmElevadoSostenido  = false;
+        _bpmPromedio         = 0;
+        _bpmInstant          = 0;
+        _ultimoLatido        = 0;
+        _idx                 = 0;
+        _tInicioBpmElevado   = 0;
+        _bpmElevadoSostenido = false;
+
+        // Choque cardíaco — reset
+        _faseChoque       = CHOQUE_REPOSO;
+        _tInicioTaqui     = 0;
+        _tTaquiConfirmada = 0;
+        _choqueCardiaco   = false;
       }
       continue;
     }
 
-    _actualizarSpo2(ir, rojo);
-
     if (checkForBeat(ir)) {
       long delta    = millis() - _ultimoLatido;
       _ultimoLatido = millis();
-      _bpmInstant   = 60.0f / (delta / 1000.0f);
+      _bpmInstant   = 60000.0f / (float)delta;   // delta en ms
 
       if (_bpmInstant > 20 && _bpmInstant < 255) {
         _tasas[_idx++] = (byte)_bpmInstant;
@@ -224,8 +293,7 @@ static void _leerMAX() {
     }
   }
 
-  // BPM elevado sostenido — solo cuenta si el promedio (no una muestra)
-  // lleva más de BPM_ELEVADO_TIEMPO_MS sobre el umbral
+  // BPM elevado sostenido
   if (_bpmPromedio >= BPM_ELEVADO && _dedo) {
     if (_tInicioBpmElevado == 0) _tInicioBpmElevado = millis();
     _bpmElevadoSostenido = (millis() - _tInicioBpmElevado) >= BPM_ELEVADO_TIEMPO_MS;
@@ -234,32 +302,13 @@ static void _leerMAX() {
     _bpmElevadoSostenido = false;
   }
 
-  // Variación brusca de BPM (cada 5s)
-  uint32_t ahora = millis();
-  if (_tUltimoSnapshot == 0) _tUltimoSnapshot = ahora;
-  if (ahora - _tUltimoSnapshot >= BPM_HISTORIAL_MS) {
-    if (_bpmHace5s > 0 && _bpmPromedio > 0) {
-      int delta = _bpmHace5s - _bpmPromedio;
-      _bpmCaidaBrusca = (delta >= 25);
-      if (_bpmCaidaBrusca) {
-        Serial.print("[ALERTA BPM] Caida brusca: ");
-        Serial.print(_bpmHace5s);
-        Serial.print(" -> ");
-        Serial.println(_bpmPromedio);
-      }
-    }
-    _bpmHace5s       = _bpmPromedio;
-    _tUltimoSnapshot = ahora;
-  }
+  // Choque cardíaco
+  _actualizarChoqueCardiaco();
 }
 
 // ============================================================
 //  DFPlayer
 // ============================================================
-static HardwareSerial      _serialDF(1);
-static DFRobotDFPlayerMini _df;
-static bool                _dfListo = false;
-
 void audioInit() {
   _serialDF.begin(9600, SERIAL_8N1, D7, D6);
   for (byte intento = 1; intento <= 3; intento++) {
@@ -299,21 +348,17 @@ void sensoresTick() {
   _leerMAX();
 }
 
-// Latch: retorna true una sola vez por evento y se autoreset
 bool caidaDetectada() {
-  if (_caidaDetectada) {
-    _caidaDetectada = false;
-    return true;
-  }
+  if (_caidaDetectada) { _caidaDetectada = false; return true; }
   return false;
 }
 
-float gActual()            { return _gActual;                                        }
-int   bpmActual()          { return _bpmPromedio;                                    }
-bool  bpmElevado()         { return _bpmElevadoSostenido;                            } // sostenido >5s
-bool  dedoDetectado()      { return _dedo;                                           }
-int   spo2Actual()         { return _spo2;                                           }
-bool  spo2Bajo()           { return _tInicioBajo > 0 && (millis() - _tInicioBajo) >= SPO2_TIEMPO_BAJO_MS; }
-bool  cuerpoInmovil()      { return _inmovil;                                        }
-bool  bpmCaidaBrusca()     { return _bpmCaidaBrusca && _dedo;                        }
-bool  sospechaDesmayo()    { return spo2Bajo() && bpmCaidaBrusca();                  }
+float gActual()       { return _gActual;           }
+bool  cuerpoInmovil() { return _inmovil;            }
+bool  posturaErguida(){ return _posturaErguida;     }
+
+int  bpmActual()      { return _bpmPromedio;        }
+bool bpmElevado()     { return _bpmElevadoSostenido;}
+bool dedoDetectado()  { return _dedo;               }
+
+bool choqueCardiaco()    { return _choqueCardiaco && _dedo;   }
