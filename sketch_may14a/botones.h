@@ -1,4 +1,4 @@
-// ============================================================
+// ============================================================ a
 //  botones.h — Struct y lógica de botones
 //  Separado del .ino para que el IDE vea el struct antes
 //  de generar prototipos automáticos

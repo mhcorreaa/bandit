@@ -1,4 +1,4 @@
-// ============================================================
+// ============================================================ a
 //  sketch_may14a.ino — MAIN
 //  Pulsera Disautonomia | XIAO ESP32-C3
 //  v3: máquina de estados OR | sin SpO2 | + filtro postural

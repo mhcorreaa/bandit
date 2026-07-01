@@ -1,4 +1,4 @@
-// ============================================================
+// ============================================================ a
 //  sensores.cpp — MPU6050 (caída + postura) + MAX30102 (BPM)
 //                 + DFPlayer
 //  v3: sin SpO2 | + filtro postural | + choque cardíaco

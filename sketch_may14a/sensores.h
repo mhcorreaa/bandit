@@ -1,4 +1,4 @@
-// ============================================================
+// ============================================================ a
 //  sensores.h — Interfaz sensores y audio
 //  v3: sin SpO2 | + filtro postural | + choque cardíaco
 //      (colapso amplitud IR eliminado — no fiable con sensor

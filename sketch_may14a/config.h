@@ -1,4 +1,4 @@
-// ============================================================
+// ============================================================ a
 //  config.h — Pines y constantes globales
 //  Pulsera Disautonomia | XIAO ESP32-C3
 //  v3: + postura | + choque cardíaco | sin SpO2 | sin colapso IR
